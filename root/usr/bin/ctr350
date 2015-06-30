@@ -1,0 +1,574 @@
+#! /usr/bin/env python
+
+"""
+usage: %(progname)s [args]
+"""
+
+import os, sys, string, time
+from optparse import OptionParser
+import urllib, urllib2
+import md5
+import binascii
+import base64
+import subprocess
+import tempfile
+
+import random
+import string
+import json
+import yaml
+
+import atexit
+import shutil
+
+import StringIO
+import gzip
+
+import socket
+
+import random
+
+import re
+
+b64_wap = ".ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+b64_reg = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+from_wap64 = string.maketrans(b64_wap, b64_reg)
+to_wap64 = string.maketrans(b64_reg, b64_wap)
+
+_passwd = None
+
+def hex_md5(str):
+  m = md5.new()
+  m.update(str)
+  return binascii.b2a_hex(m.digest())
+
+def put(url, data):
+   request = urllib2.Request(url, data)
+   request.get_method = lambda: 'PUT'
+   return urllib2.urlopen(request)
+
+def login(ipaddr,passwd):
+  global _passwd
+  global _ctr35
+  socket.setdefaulttimeout(10)
+
+  response = urllib2.urlopen('http://%s/pre_login.js'%ipaddr)
+  
+  # figure out if we're dealing with a ctr350 or a ctr35
+  _ctr35 = response.geturl().endswith('/login/') or response.geturl().endswith('/admin/')
+  #_ctr35 = True
+  if _ctr35:
+    print "CTR35 detected"
+    # if we get /admin, we're already logged in
+    if response.geturl().endswith('/admin/'):
+       print "Already logged in"
+       return True
+  else:
+    print "CTR350 detected"
+
+  if passwd is None:
+    arp = subprocess.Popen(["arp", "-n", ipaddr], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (o,e) = arp.communicate()
+    res = arp.wait()
+    mac = o.split()[8]
+    if _ctr35:
+      passwd = ''.join(mac.split(':')[2:])
+    else:
+      passwd = ''.join(mac.split(':')[3:])
+    print "Using default mac-address-based password: %s"%passwd
+
+  _passwd = passwd
+
+  if _ctr35:
+    # we're dealing with a CTR35.
+    
+    # set up cookie handling
+    opener = urllib2.OpenerDirector()
+    opener.add_handler(urllib2.HTTPHandler())
+    #opener.add_handler(MultipartPostHandler.MultipartPostHandler())
+    opener.add_handler(urllib2.HTTPCookieProcessor())
+    opener.add_handler(urllib2.HTTPRedirectHandler())
+    opener.add_handler(urllib2.HTTPErrorProcessor())
+    urllib2.install_opener(opener)
+
+    # URL and POST data for password form
+    url = "http://%s/login/do_auth"%ipaddr
+    data = urllib.urlencode({'password': _passwd})
+    response = urllib2.urlopen(url, data)
+
+    # if we end up at /admin/, the password was right
+    return response.geturl().endswith('/admin/')
+  else:
+    data64= response.read()
+    data=base64.decodestring(data64[6:-1].translate(from_wap64))
+    # we're dealing with a CTR350. do the appropriate madness
+    shex = binascii.b2a_hex(data).rstrip('0').upper()
+    shex = shex + '0'*(len(shex)%2)
+    goodp = passwd + '0'*(16 - len(passwd))
+    str = shex + goodp;
+    str = str + '0'*(64 - len(str))
+    salthash = shex + hex_md5(str)
+  
+    a = binascii.a2b_hex(salthash)
+    if (len(a) % 3 > 0):
+      a = a + '\x00'*(3 - len(a)%3)
+  
+    fin_passwd = base64.encodestring(a).translate(to_wap64)
+  
+  
+    url = "http://%s/post_login.cgi?data=%s" %(ipaddr,fin_passwd)
+    lines = urllib2.urlopen(url).readlines()
+  
+    return True in ["Basic_Wizard.html" in l for l in lines]
+
+def saveConfig(ipaddr, save_file):
+  if _ctr35:
+    # type=button id=ext-gen309 class=x-btn-text
+    url = "http://%s/api/config" % ipaddr
+    response = urllib2.urlopen(url)
+    
+    # strip the outermost data key from the response
+    data = json.loads(response.read())['data']
+    output = json.dumps(data)
+    # pretty formatting
+    #output = json.dumps(data, sort_keys=True, indent=3)
+
+    f = open(save_file, "w")
+    f.write(output)
+    f.close()
+  else:
+    url = "http://%s/save_settings.cgi" % ipaddr
+    urllib.urlretrieve(url, filename=save_file)
+
+def loadConfig(ipaddr, fn, name):
+  global _passwd
+  if _ctr35:
+    # On CTR35:
+    configfile = fn
+    if os.path.exists(fn + '.35'):
+       configfile = fn + '.35'
+
+    url = "http://%s/api/config" % ipaddr
+    data = open(configfile, 'r').read()
+    config = json.loads(data)
+
+    new_ip = config['lan'][0]['ip_address']
+    print "New IP %s"%new_ip
+
+    data = urllib.urlencode({'data': data})
+    response = put(url, data)
+
+    resp = json.loads(response.read())
+    if not resp['success']:
+      print "Load config failed:"
+      print json.dumps(resp, sort_keys=True, indent=3)
+      sys.exit(1)
+
+    _passwd = config['system']['users'][0]['password']
+
+    time.sleep(10)
+
+    for i in xrange(100):
+      try:
+        if login(ipaddr,_passwd):
+          break
+        else:
+          print >> sys.stderr, "Password incorrect!"
+          sys.exit(1)
+      except urllib2.HTTPError:
+        time.sleep(1)
+      except urllib2.URLError:
+        time.sleep(1)
+
+    print "Loaded config; rebooting"
+
+    # reboot for new settings
+    url = "http://%s/api/control/system" % ipaddr
+    data = urllib.urlencode({'data': json.dumps({'reboot': 1})})
+    try:
+      response = put(url, data)
+      resp = json.loads(response.read())
+      if not resp['success']:
+        print "Router reboot failed:"
+        print json.dumps(resp, sort_keys=True, indent=3)
+    except urllib2.URLError:
+      print "Got URLError; ignoring"
+      # do nothing
+
+    waitForBoot(ipaddr, new_ip)
+  
+  else:
+    tmp_dir = tempfile.mkdtemp(prefix='cradlepointjs')
+    # Afterwards, we are going to remove the directory so that the temporary .js stuff gets cleaned up
+    atexit.register(shutil.rmtree, tmp_dir)
+  
+    # Fetch the .js files we need from the server (unfortunately they are only available gzipped)
+    files = ["uigenpro.js", "fixup_settings.js", "createdata.js", "pack_all.js"]
+    for f in files:
+      req = urllib2.Request("http://%s/%s"%(ipaddr,f))
+      req.add_header('Accept-encoding','gzip')
+      opener = urllib2.build_opener()
+      f_in = opener.open(req)
+      compresseddata = f_in.read()
+      compressedstream = StringIO.StringIO(compresseddata)
+      try:
+        gzipper = gzip.GzipFile(fileobj=compressedstream)
+        data = gzipper.read()
+      except IOError:
+        data = compresseddata
+      f_out = open(tmp_dir+"/"+f,"w")
+      f_out.write(data)
+      f_out.close()
+  
+    # Fetch the existing settings from server
+    urllib.urlretrieve("http://%s/save_settings.cgi"%(ipaddr), filename=tmp_dir+"/server_conf.gws")
+  
+    # Create our override file
+    f_override = open(tmp_dir+"/override.js","w")
+  
+    f_override.write("""
+function executeActiveTags() {}
+function alert(message) {print("ALERT: " + message);}
+function restoreError (message) {alert(message); return 0;}
+""")
+  
+    f_override.close()
+
+    createSettingsJS(tmp_dir, files, name, 0, fn)
+  
+    # Invoke our javascript and get back the data
+    runjs = subprocess.Popen(["js", tmp_dir+"/gensettings.js"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (o,e) = runjs.communicate()
+    res = runjs.wait()
+    data = o.splitlines()
+    new_ip = data[0]
+    new_passwd = data[1]
+    new_ssid   = data[2]
+    new_config = data[3]
+    if res == 0:
+      urllib2.urlopen("http://%s/restore_settings.cgi?link=Tools_Admin.html"%(ipaddr),"data=%s"%new_config)
+      cmd = "\x01\x00\x00"
+      cmd_enc = base64.encodestring(cmd).translate(to_wap64)
+      urllib2.urlopen("http://%s/cmd.cgi?data=%s"%(ipaddr,cmd_enc))
+    else:
+      print >> sys.stderr, "Error: failure in generating config settings"
+  
+    _passwd = new_passwd
+    print "Uploaded configuration."
+    print "New ip: %s.  New password: %s.  New SSID: %s."%(new_ip, new_passwd, new_ssid)
+
+    waitForBoot(ipaddr, new_ip)
+
+def createSettingsJS(tmp_dir, files, name, version, fn):
+    # Create our main javascript file
+    f_vm = open(tmp_dir+"/"+"gensettings.js","w")
+    # I don't want to fix the stuff which points to this file
+    # so, just going to tell gensettings to run the nodevm.js file.
+
+    vmfiles = files + ["override.js", "server_conf.gws"]
+
+    f_vm.write("""
+var fs = require("fs");
+var vm = require("vm");
+
+var buffer = "var window = new Object;";
+var files = [""")
+
+    for f in vmfiles[:-1]:
+        f_vm.write("\"%s\","%(tmp_dir+"/"+f))
+    f_vm.write(""""%s"];
+
+for (path in files) {
+    var stuff = fs.readFileSync(files[path], "utf8");
+    buffer += stuff;
+    buffer += "\\n";
+}
+""" % (tmp_dir+"/"+vmfiles[-1]))
+    if version == 0:
+        f_vm.write("""
+buffer += fs.readfileSync("%s", "utf8");
+""" % (tmp_dir+"/"+fn))
+
+    f_vm.write("""
+buffer += fs.readFileSync("%s", "utf8");
+""" % (tmp_dir+"/"+"preset.js"))
+    if version == 0:
+        f_vm.write("""
+buffer += fs.readFileSync("%s", "utf8");""" % (fn))
+    f_vm.write("""buffer += "\\n";
+buffer += fs.readFileSync("%s", "utf8");
+buffer += "\\n";
+
+vm.runInThisContext(buffer);
+""" % (tmp_dir+"/"+"nodeVM.js"))
+
+    f_vm.close()
+
+    f_pre = open(tmp_dir+"/"+"preset.js","w") # temp files, who cares if we have a million of them? :D
+    f_pre.write("""
+byte_array = convertFromBase64(data);
+data = null;
+unpackAll();""")
+
+    if version == 0:
+        f_pre.write("""current_data = data;
+data = null;
+unpackAll = null;"
+""")
+
+    f_pre.close()
+
+    f_js = open(tmp_dir+"/"+"nodeVM.js","w")
+
+    if version == 0:
+        f_js.write("""
+"if (typeof(data) != "string") {
+    console.log("Bad configuration file (no data)!");
+    throw new Error("Bad configuration file (no data)!");
+}
+
+byte_array = convertFromBase64 (data);
+
+if (typeof(unpackAll) != "function") {
+    console.log("Bad configuration file (no unpack)!");
+    throw new Error("Bad configuration file (no unpack)!");
+}
+
+data = null;
+unpackAll();""")
+
+    if name is not None:
+      f_js.write("""
+// Override values for branding!
+data.wireless.SSID="%s";
+"""%(name,))
+  
+    if version == 0:
+        f_js.write("""
+// Fixup old settings if necessary
+if (typeof(fixup_old_settings) == "function") {
+    restored_data = data;
+    data = null;
+    fixup_old_settings();
+    data = restored_data;
+}
+  
+// Merge over server instance
+mergeObject (current_data,data);
+data = current_data;
+""")
+    f_js.write("""
+// Repack
+byte_array_has_error = 0;
+packAll();
+if (byte_array_has_error) {
+    console.log("Restored data not acceptable");
+    throw new Error("Restored data not acceptable");
+}
+  
+// Print output post data so python can grab it
+console.log(data.lan_network_address)
+console.log(data.password)
+console.log(data.wireless.SSID)
+console.log(convertToBase64(byte_array))
+""")
+    f_js.close()
+
+def changeSSID(ipaddr, name):
+  if _ctr35:
+    url = "http://%s/api/config/wlan/bss/0" % ipaddr
+    data = urllib.urlencode({'data': json.dumps({"ssid": name})})
+
+    response = put(url, data)
+#    request = urllib2.Request(url, put)
+#    request.get_method = lambda: 'PUT'
+#    response = urllib2.urlopen(request)
+
+    resp = json.loads(response.read())
+    if not resp['success']:
+      print "Set SSID Failed:"
+      print json.dumps(resp, sort_keys=True, indent=3)
+
+# Toggle the WPS LED, just to prove we can do something
+#    url = "http://%s/api/control/gpio" % ipaddr
+#    response = urllib2.urlopen(url)
+#    data = json.loads(response.read())['data']
+#    
+#    led = data['LED_WPS']
+#    if not led:
+#      print "WPS LED on"
+#      data = {'LED_WPS': 1}
+#    else:
+#      print "WPS LED off"
+#      data = {'LED_WPS': 0}
+#
+#    url = "http://%s/api/control/gpio" % ipaddr
+#    put = json.dumps(data).replace(' ', '')
+#    put = urllib.urlencode({'data': put})
+#    request = urllib2.Request(url, put)
+#    request.get_method = lambda: 'PUT'
+#    response = urllib2.urlopen(request)
+#    resp = json.loads(response.read())
+#    if resp['success']:
+#      print "Set WPS LED Succeeded"
+#    else:
+#      print "Set WPS LED Failed"
+
+  else:
+    tmp_dir = tempfile.mkdtemp(prefix='cradlepointjs')
+    # Afterwards, we are going to remove the directory so that the temporary .js stuff gets cleaned up
+    atexit.register(shutil.rmtree, tmp_dir)
+  
+    # Fetch the .js files we need from the server (unfortunately they are only available gzipped)
+    files = ["uigenpro.js", "fixup_settings.js", "createdata.js", "pack_all.js"]
+    for f in files:
+      req = urllib2.Request("http://%s/%s"%(ipaddr,f))
+      req.add_header('Accept-encoding','gzip')
+      opener = urllib2.build_opener()
+      f_in = opener.open(req)
+      compresseddata = f_in.read()
+      compressedstream = StringIO.StringIO(compresseddata)
+      try:
+        gzipper = gzip.GzipFile(fileobj=compressedstream)
+        data = gzipper.read()
+      except IOError:
+        data = compresseddata
+      f_out = open(tmp_dir+"/"+f,"w")
+      f_out.write(data)
+      f_out.close()
+  
+    # Fetch the existing settings from server
+    urllib.urlretrieve("http://%s/save_settings.cgi"%(ipaddr), filename=tmp_dir+"/server_conf.gws")
+  
+    # Create our override file
+    f_override = open(tmp_dir+"/override.js","w")
+  
+    f_override.write("""
+function executeActiveTags() {}
+function alert(message) {print("ALERT: " + message);}
+function restoreError (message) {alert(message); return 0;}
+""")
+  
+    f_override.close()
+
+    # Create our main javascript file
+    createSettingsJS(tmp_dir, files, name, 1, "")
+  
+    # Invoke our javascript and get back the data
+    runjs = subprocess.Popen(["js", tmp_dir+"/gensettings.js"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (o,e) = runjs.communicate()
+    res = runjs.wait()
+    data = o.splitlines()
+    new_ip = data[0]
+    new_passwd = data[1]
+    new_ssid   = data[2]
+    new_config = data[3]
+    if res == 0:
+      urllib2.urlopen("http://%s/restore_settings.cgi?link=Tools_Admin.html"%(ipaddr),"data=%s"%new_config)
+      cmd = "\x01\x00\x00"
+      cmd_enc = base64.encodestring(cmd).translate(to_wap64)
+      urllib2.urlopen("http://%s/cmd.cgi?data=%s"%(ipaddr,cmd_enc))
+    else:
+      print >> sys.stderr, "Error: failure in generating config settings"
+  
+    global _passwd
+    _passwd = new_passwd
+    print "Uploaded configuration."
+    print "New ip: %s.  New password: %s.  New SSID: %s."%(new_ip, new_passwd, new_ssid)
+
+    waitForBoot(ipaddr, new_ip)
+
+
+def waitForBoot(oldip, newip):
+  # Use ip route to determine if we are likely to still be able to find the router
+  if1 = "Unknown1"
+  runip = subprocess.Popen(["ip", "route", "get", oldip], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  (o,e) = runip.communicate()
+  res = runip.wait()
+
+  m = re.search(r"dev (\w+)", o)
+  if m is not None:
+    if1 = m.group(1)
+
+  if2 = "Unknown2"
+  runip = subprocess.Popen(["ip", "route", "get", newip], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  (o,e) = runip.communicate()
+  res = runip.wait()
+
+  m = re.search(r"dev (\w+)", o)
+  if m is not None:
+    if2 = m.group(1)
+
+  if (if1 != if2):
+    print >> sys.stderr, "The configuration of the device has likely changed."
+    print >> sys.stderr, ""
+    print >> sys.stderr, "old ip %s: \t routed via '%s'"%(oldip, if1)
+    print >> sys.stderr, "new ip %s: \t routed via '%s'"%(newip, if2)
+    print >> sys.stderr, ""
+    print >> sys.stderr, "You probably want to add an ethernet alias such as: "
+    print >> sys.stderr, ""
+    print >> sys.stderr, "\tsudo ifconfig %s:1 %s.X"%(if1,".".join(newip.split(".")[0:3]))
+    print >> sys.stderr, ""
+    print >> sys.stderr, "in order to talk to the router."
+    sys.exit(1)
+  
+  fw = "Unknown"
+  print "Waiting for WAP to boot..."
+
+  # Give the router a little time to start the reboot
+  time.sleep(5)
+
+  found = False
+  for i in xrange(100):
+    try:
+      if login(newip,_passwd):
+        found = True
+        break
+      else:
+        print >> sys.stderr, "Password incorrect!"
+        sys.exit(1)
+    except urllib2.HTTPError:
+      time.sleep(1)
+    except urllib2.URLError:
+      time.sleep(1)
+
+  if found:
+    print "WAP has resumed successfully on: %s"%(newip)
+  else:
+    print >> sys.stderr, "Router has not resumed successfully.  Please go to http://pr.willowgarage.com/wiki/PR2/Admin/Troubleshooting for information on debugging."
+    sys.exit(1)
+
+  
+def main(argv, stdout, environ):
+  parser = OptionParser(usage="usage: cradlepoint.py [-i <ip>] [-p <password>] [-s <config> | -l <config>] [-n <name]")
+  parser.add_option("-i","--ipaddr",action="store",type="string", dest="ipaddr",default="192.168.0.1")
+  parser.add_option("-p","--passwd",action="store",type="string", dest="passwd",default=None)
+  parser.add_option("-s","--save",action="store",type="string", dest="save_file",default=None)
+  parser.add_option("-l","--load",action="store",type="string", dest="load_file",default=None)
+  parser.add_option("-n","--name",action="store",type="string", dest="name",default=None)
+  (options, args) = parser.parse_args()
+
+  global _passwd
+  _passwd = options.passwd
+
+  if (options.save_file and options.load_file):
+    parser.error("Cannot save and load file at the same time")
+
+  try:
+    if not login(options.ipaddr,_passwd):
+      print >> sys.stderr, "Password incorrect!"
+      sys.exit(1)
+  except urllib2.URLError, (e,):
+    print >> sys.stderr, "Could not connect to: %s, %s"%(options.ipaddr, e)
+    sys.exit(1)
+
+  if (options.save_file):
+    saveConfig(options.ipaddr, options.save_file)
+
+  if (options.load_file): 
+    loadConfig(options.ipaddr, options.load_file, options.name)
+  elif (options.name):
+    changeSSID(options.ipaddr, options.name)
+
+if __name__ == "__main__":
+  main(sys.argv, sys.stdout, os.environ)
